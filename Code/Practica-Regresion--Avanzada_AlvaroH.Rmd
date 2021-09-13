@@ -1,0 +1,590 @@
+---
+title: "Práctica Regresión avanzada"
+author: "Alvaro Herreruela"
+date: "10/2/2021"
+output: html_document
+---
+
+```{r, include=FALSE,warning=FALSE}
+library(tidyverse)
+library(effects)
+library(GGally)
+library(MASS)
+library(pscl)
+library(dplyr)
+library(knitr)
+library(corrplot)
+library(mice)
+library(ggplot2)
+library(GGally)
+library(effects)
+library(caret)
+library(leaps)
+library(olsrr)
+library(glmnet)
+library(pls)
+```
+## Introducción
+
+Durante este último año hemos escuchado mucho ruido alrededor del mismo tema, el Covid. Los países se han quedado paralizados ante la presencia de un virus que en principio parecía inofensivo y luego resulta que ha dejado miles de muertos, dejando a los gobiernos destapados y sus decisiones en entredicho. Prácticamente todos los países han maniobrado de la misma manera a la hora de afrontar el problema. Compra de recursos como mascarillas y tests, y cierre total y parcial de territorios. 
+
+Muchas personas se han preguntado si las medidas han sido las adecuadas o incluso si han sido efectivas para afrontar esta crisis. Es por eso, que he decidido analizar el impacto de los recursos utilizados (hospitales y PCR) y de las medidas de movilidad impuestas a través de la modelos de regresión avanzada y GLM.
+
+## Preprocesamiento
+
+Para realizar el estudio he decidido utilizar dos datasets:
+
+1) Covid por provincias: aquí se recogen datos sobre los recursos así com PCR, personas hospitalizadas y otros tests, todos los días desde febrero de 2020 en España por provincias y comunidades.
+
+2) Movilidad por provincias: aquí se recoge la movilidad en super mercados, parques, farmacias, centros comerciales... todos los días desde febrero por países y territorios detro de un país
+
+El preprocesamiento de datos ha sido algo tediosos ya que el primer dataset estaba lleno de missing values, valores incorrectos como muertes con signo negativo, outliers y muchas variables correladas. Para reducir la presencia de missing values, procedentes la gran mayoría de la falta de información de la primera ola, he filtrado por fecha a apartir del 1 de julio de 2020. He hecho esto con ambos datasets. Además he cogido el primer dataset(covid_provincias) y le he quitado posible variables correladas como por ejemplo aquellas variables acumuladas de otras variables, variables que eran la media de otras y tasas, como por ejemplo la tasa por 100.000 habitantes. Además he sustituido los valores negativos del primer dataset por 0 ya que los valores negativos no tenían sentido en el conjunto de datos.
+
+
+
+```{r,echo=FALSE, include=FALSE}
+#cargar los datos
+movilidad <- read.csv('C:/Users/aherreruela/Desktop/Master/Regresión avanzada/Global_Mobility_Report.csv', sep=',', encoding = 'UTF-8')
+covid_provincias <- read.csv('C:/Users/aherreruela/Desktop/Master/Regresión avanzada/covid19-provincias-spain_consolidated.csv', sep = ',', encoding = 'UTF-8')
+#filtrar por país y fecha
+movilidadEsp <-  filter(movilidad, country_region == 'Spain')
+covid_provincias <- filter(covid_provincias, date >= '2020-07-01')
+covid_provincias <- filter(covid_provincias,date <= '2021-02-05')
+movilidadEsp <- filter(movilidadEsp,date >= '2020-07-01')
+movilidadEsp <- movilidadEsp[movilidadEsp$sub_region_1 != '', ]
+#mirar estadisticos y nas para observar la presencia de outliers
+summary(covid_provincias)
+summary(movilidadEsp)
+head(covid_provincias)
+head(movilidadEsp)
+str(covid_provincias)
+str(movilidadEsp)
+```
+```{r,echo=FALSE}
+barplot(colMeans(is.na(covid_provincias)),las = 2)
+barplot(colMeans(is.na(movilidadEsp)), las = 2)
+
+#eliminar posible correlacion entre columnas
+covid_provincias[,c(2,3,10,14,15,17,24,25,29,30,31,32,38,39,40,41,43,45,47,48,49,50)] <- NULL
+covid_provincias[,c(29:36)] <- NULL
+covid_provincias[,c(8,22:27)] <- NULL
+#eliminar valores negativos
+covid_provincias$daily_deaths <-  ifelse(covid_provincias$daily_deaths<0,0,covid_provincias$daily_deaths)
+#covid_provincias<- covid_provincias[rowSums(covid_provincias[,] < 0, na.rm = T) == 0, ]
+covid_provincias <- covid_provincias[order(covid_provincias$ccaa),]
+```
+
+# Missing Values
+
+Podemos observar que seguimos teniendo una gran cantidad de missing values en nuestros datasets. Para poder llegar a alguna conclusión en las hipótesis que hemos planteado hay que imputar estos missing values de alguna manera. En el primer dataset los datos faltantes son NMAR (not missing at random) lo que quiere decir que las variables dependen de ellas mismas y del conjunto de variables del dataset. En el segundo dataset los missing values son MAR (missing at random) donde los valores valtantes dependen de las observaciones de las propias variables
+
+Para imputar los missing values, he utilizado la libreria MICE. En el primer dataset he utilizado un árbol de regresión para predecir los missing values. En este caso es necesario sacar las variables que más adelante se van a predecir del dataser para que las variables imputadas no estén influenciadas por esta variable. En el segundo caso he utilizado predictive mean machine, donde te predice según los valores observados de la propia variable.
+
+```{r,echo=FALSE, include = TRUE}
+#imputar nas
+summary(covid_provincias)
+summary(movilidadEsp)
+num_casos <- covid_provincias[,"num_casos"]
+covid_provincias[,'num_casos'] <- NULL
+daily_deaths <- covid_provincias[,'daily_deaths']
+covid_provincias[,'daily_deaths'] <- NULL
+set.seed(2875)
+imputacion_missing <- mice(covid_provincias,method = 'cart', maxit = 20)
+imputacion_covid <- imputacion_missing$imp$PCR
+covid_provincias <- complete(imputacion_missing,1)
+covid_provincias <- cbind(covid_provincias,num_casos,daily_deaths)
+
+set.seed(3456)
+imputacion_missing2 <- mice(movilidadEsp,method = 'pmm', maxit = 20)
+imputacion_movilidad <- imputacion_missing2$imp$parks
+movilidadEsp <- complete(imputacion_missing2,2)
+```
+
+# Reagrupación y fusión de datasets
+
+ En este último paso del feature engineering he agrupado las variables de ambos datasets por comunidades autónomas y he tenido que cambiar el nombre de todas las comunidades autónomas del segundo dataset para facilitar más adelante la fusión de ambos datasets. Por último he graficado la correlación entre las diferentes variables para echar un último vistazo a la colinealidad de las variables. He observado que new cases estaba correlada con el número de casos y hospitalize estaban correladas con varias variables. He eliminado estas variables para mi modelo GLM y así mejorar la representatividad de nuestra predicción.
+
+```{r,echo=FALSE, warning=FALSE}
+colnames(movilidadEsp) <- gsub('_percent_change_from_baseline','',colnames(movilidadEsp))
+
+movilidadEsp<- movilidadEsp %>% group_by(sub_region_1, date)%>% summarise(retail_and_recreation = mean(retail_and_recreation), grocery_and_pharmacy = mean(grocery_and_pharmacy), parks = mean(parks), transit_stations = mean(transit_stations), workplaces = mean(workplaces), residential = mean(residential))
+
+covid_provincias <- covid_provincias %>% group_by(ccaa,date) %>% summarise_all(list(sum), na.rm = T)
+
+movilidadEsp[movilidadEsp$sub_region_1 == 'Andalusia', "sub_region_1"] <- 'Andalucía'
+movilidadEsp[movilidadEsp$sub_region_1 == 'Aragon', "sub_region_1"] <- 'Aragón'
+movilidadEsp[movilidadEsp$sub_region_1 == 'Asturias', "sub_region_1"] <- "Asturias, Principado de" 
+movilidadEsp[movilidadEsp$sub_region_1 == "Balearic Islands", "sub_region_1"] <- "Balears, Illes"
+movilidadEsp[movilidadEsp$sub_region_1 == 'Basque Country', "sub_region_1"] <- 'País Vasco'
+movilidadEsp[movilidadEsp$sub_region_1 == "Canary Islands", "sub_region_1"] <- "Canarias"
+movilidadEsp[movilidadEsp$sub_region_1 == "Castile-La Mancha" , "sub_region_1"] <- "Castilla - La Mancha"
+movilidadEsp[movilidadEsp$sub_region_1 == "Castile and León" , "sub_region_1"] <- "Castilla y León" 
+movilidadEsp[movilidadEsp$sub_region_1 == "Catalonia", "sub_region_1"] <- "Cataluña"
+movilidadEsp[movilidadEsp$sub_region_1 == 'Community of Madrid', "sub_region_1"] <- "Madrid, Comunidad de" 
+movilidadEsp[movilidadEsp$sub_region_1 == 'La Rioja', "sub_region_1"] <- "Rioja, La" 
+movilidadEsp[movilidadEsp$sub_region_1 == 'Navarre', "sub_region_1"] <- "Navarra, Comunidad Foral de" 
+movilidadEsp[movilidadEsp$sub_region_1 == 'Region of Murcia', "sub_region_1"] <- "Murcia, Región de" 
+movilidadEsp[movilidadEsp$sub_region_1 == 'Valencian Community', "sub_region_1"] <- "Comunitat Valenciana"
+
+colnames(movilidadEsp)[1] <- 'ccaa'
+class(movilidadEsp$ccaa) <- 'character'
+
+covid_movilidad_ESP<- inner_join(covid_provincias,movilidadEsp, by=c('date','ccaa'))
+#summary(covid_movilidad_ESP)
+#colinelidad de new cases-num_casos, hospitalize-intensive_care-num_hosp-num_uci_num_def
+ggcorr(covid_movilidad_ESP, label = T)
+covid_movilidad_ESP[,c(5,12,13,14,15)] <- NULL
+covid_movilidad_ESP_GLM <- covid_movilidad_ESP[,-c(3,7,11,12,13)]
+summary(covid_movilidad_ESP_GLM)
+
+```
+
+## Distribución de las variables
+
+Para conocer la distribución de nuestra variable a predecir he hecho un histograma. Observando el histograma vemos que la variable 0 es la más repetida. Esto nos da un primer indicio de que esta variable puede ser un 0 inflado. Podemos observar que es descendente indicándonos que los datos estan sesgados a los valores más bajos 
+
+```{r pressure, echo=FALSE}
+covid_movilidad_ESP$total <- rowSums(covid_movilidad_ESP[,c(17:22)])
+#zero inflado
+ggplot(covid_movilidad_ESP, aes(x = num_casos))+
+  geom_histogram(fill='blue')
+```
+
+
+
+En este gráfico de barras, podemos observar que aquellas comunidades con mayor número de casos son la Comunidad de Madrid, Cataluña, Comunidad Valenciana y Andalucía
+
+
+
+```{r, echo=FALSE}
+#cataluña, madrid, castilla y leon, andalucia y valencia las + afectadas
+ggplot(covid_movilidad_ESP, aes(x = num_casos, y = ccaa))+
+  geom_bar(stat = 'identity',fill='blue')
+```
+
+
+
+En este primer gráfico, podemos observar que no hay una aparente relacion lienal entre muerte y número de casos, lo que es un poco raro ya que normalmente cuanto más casos haya, más muertes habrá
+
+
+````{r, echo = FALSE}
+#no hay aparente relacion entre casos y muertes(raro)
+ggplot(covid_movilidad_ESP, aes(x = daily_deaths, y = num_casos))+
+  geom_point(stat = 'identity',fill='blue')
+#puede haber relacion entre num_casos y PCR
+ggplot(covid_movilidad_ESP, aes(x= num_casos, y = PCR, color = daily_deaths))+
+  geom_point(stat='identity')+
+  scale_color_gradient2(low = "blue4", high = "red1", mid = "yellow", midpoint = mean(covid_movilidad_ESP$daily_deaths))
+```
+
+
+
+
+En estos dos últimos gráficos, podemos observar que no hay una relación lineal aparente entre la movilidad y el números de casos
+
+
+
+```{r, echo=FALSE, warning=FALSE}
+#no hay relacion entre movilidad y muertes aparentemente
+ggplot(covid_movilidad_ESP, aes(x= retail_and_recreation, y = num_casos, color = daily_deaths))+
+  geom_point(stat='identity')+
+  scale_color_gradient2(low = "blue4", high = "red1", mid = "yellow", midpoint = mean(covid_movilidad_ESP$daily_deaths))
+
+ggplot(covid_movilidad_ESP, aes(x= total, y = num_casos, color = daily_deaths))+
+  geom_point(stat='identity')+
+  scale_color_gradient2(low = "blue4", high = "red1", mid = "yellow", midpoint = mean(covid_movilidad_ESP$daily_deaths))
+
+
+covid_movilidad_ESP$total <- NULL
+ggcorr(covid_movilidad_ESP, label = T)
+```
+
+# Modelización GLM
+
+Para modelizar, he creado una serie de bucles donde me imputa la familia y me devuelve el resumen del modelo de cada familia. Vamos a utilizar la familia gaussiana, la poisson y quasipoisson de manera que cada link por defecto es identity, log y log respectivamente. No podemos utilizar otras familias como por ejemplo la binomial, ya que la variable respuesta no es binomial.
+
+
+Para realizar el análisis, he partido mi datset en train y test. En primer lugar voy a analizar la posible falta de recursos, para ver si las muertes han estado influidas por el test PCR y por la hospitalización de los que se recuperan y de los que no, mirando aquí si los hospitales tenían recursos suficientes para hacer frente al Covid siendo el PCR una herramienta para reducir la incertidumbre. Podemos observar que el mejor modelo es el gaussiano (sorprendentemente porque la variable respuesta tienen muchos ouliers y suele ser mejor modelo el de poisson ya que me deforma la curva convertiendola en logaritmo) teniendo el AIC muy por debajo de la devianza del modelo naive y también muy por debajo del AIC de la poisson. La quasipoisson además, nos está diciendo que el modelo tiene sobredispersión diciendo que en la práctica los datos tienen más varianza. Por último, podemos ver que el p-valor de PCR, hospitalizados y muertos es muy pequeña mientras que las relaciones entre hospitalizados y muertes, y hospitalizados y recuperados es menos influyente.
+
+```{r, echo=FALSE, warning=FALSE}
+set.seed(2234)
+in_train <- createDataPartition(covid_movilidad_ESP_GLM$daily_deaths, p = 0.80, list = FALSE)
+training <- covid_movilidad_ESP_GLM[ in_train,]
+testing <- covid_movilidad_ESP_GLM[-in_train,]
+
+
+family <-  c('gaussian','poisson','quasipoisson')
+best_family <- function(family){
+  for (x in family){
+    covid_movilidad_ESP_GLM.mod <- glm(daily_deaths~PCR+hospitalized*recovered+hospitalized*deceased , family = x, data = training )
+    print(paste('Familia:',x))
+    print(summary(covid_movilidad_ESP_GLM.mod))
+    print('-----------')
+  }
+}
+
+best_family(family = family)
+```
+
+Analizando con mas detalle este modelo no podemos decir que la influencia del PCR ha disminuido la incertidumbre y como resultado el número de muertes ya que se puede observar una tendencia positiva indicándonos que cuantos más PCR se hacen más muertes al día hay. Tampoco podemos concluir diciendo nada del resto de variables ya que se puede observar que ha medida que aumentan los hospitalizados y muertos, y los hospitalizados y recuperados, aumentan el número de muertos diarios, lo que hace que el modelo sea difícil interpretar ya que es incongruente aplicado a la realidad.
+
+```{r, echo=FALSE, warning=FALSE}
+covid_movilidad_ESP_GLM.modrecursos <- glm(daily_deaths~PCR+hospitalized*recovered+hospitalized*deceased, family = 'gaussian', data = training )
+
+plot(effect("PCR", covid_movilidad_ESP_GLM.modrecursos), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="PCR", ylab="rate", rug=FALSE, main="")
+
+
+plot(effect("hospitalized", covid_movilidad_ESP_GLM.modrecursos), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="Hospitalized", ylab="rate", rug=FALSE, main="")
+
+plot(effect("hospitalized:recovered", covid_movilidad_ESP_GLM.modrecursos), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="hospitalized:recovered", ylab="rate", rug=FALSE, main="")
+
+plot(effect("hospitalized:deceased", covid_movilidad_ESP_GLM.modrecursos), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="hospitalized:deceased", ylab="rate", rug=FALSE, main="")
+
+```
+
+En este segundo apartado, vamos a analizar si la movilidad ha influido en el número de casos. Además antes de hacer la partición he creado una nueva variable denominada total_mov que recoge el total de movilidad de todas las areas. Para hacer la partición tomado otro training y test set con el output de número de casos en vez de muertes diarias. 
+
+En el primer modelo hemos analizado nuestra variable output con todos los ratios de movilidad y en el segundo hemos tomado únicamente el total. Utilizando un nuevo bucle donde nos representa todos los modelos posibles con las diferentes familias, he observado que la familia gaussiana volvía a tener mejor AIC que el resto de modelos y que además, es mejor modelo aquel en el que introducimos todos los ratios de movilidad. Podemos observar que retail_and_recreation, transit_stations y workplaces apenas tienen influencia sobre el modelo, mientras que el resto sí que lo tienen monstrando un p-valor bajo y unos mejores betas.
+
+```{r, echo=FALSE, warning=FALSE}
+covid_movilidad_ESP_GLM$total_mov <-  rowSums(covid_movilidad_ESP[,c(17:22)])
+set.seed(2234)
+in_train2 <- createDataPartition(covid_movilidad_ESP_GLM$num_casos, p = 0.80, list = FALSE)
+training2 <- covid_movilidad_ESP_GLM[ in_train2,]
+testing2 <- covid_movilidad_ESP_GLM[-in_train2,]
+
+best_family <- function(family){
+  for (x in family){
+    covid_movilidad_ESP_GLM.mod <- glm(num_casos~retail_and_recreation+grocery_and_pharmacy+parks+transit_stations+workplaces+residential, family = x, data = training2 )
+    print(paste('Familia:',x))
+    print(summary(covid_movilidad_ESP_GLM.mod))
+    print('-----------')
+  }
+}
+
+
+
+best_family(family = family)
+
+
+best_family <- function(family){
+  for (x in family){
+    covid_movilidad_ESP_GLM.mod <- glm(num_casos~total_mov, family = x, data = training2 )
+    print(paste('Familia:',x))
+    print(summary(covid_movilidad_ESP_GLM.mod))
+    print('-----------')
+  }
+}
+
+best_family(family = family)
+
+```
+
+Graficando el modelo sobre las variables, podemos encontrar interpretaciones bastante curiosas. He graficado únicamente aquellas variables que tenian betas influyentes. Aquí podemos encontrar que a medida que aumenta la movilidad de los parques sobre la línea base, el número de casos desciende aunque podemos observar que la parte sombreada es muy ancha indicando que el intervalo de confianza es muy grande. En cambio la movilidad a farmacias, tiendas y residencias hace que el número de casos aumente. Esto se puede interpretar de manera que aquellas personas que van a las farmacias es porque están enfermas y en época de Covid, muchas de ellas pueden estar contagiadas y acuden a la farmacia sin concocimiento de ello. Los parques en cambio, a medida que han ido aumentando los casos se han ido cerrando lo que hace que el transito de personas sea menor, por eso no tiene sentido que disminuyan los casos cuando aumenta el tránsito de personas.
+
+```{r, echo = FALSE, warning=FALSE}
+covid_movilidad_ESP_GLM.modmovilidad <- glm(num_casos~retail_and_recreation+grocery_and_pharmacy+parks+transit_stations+workplaces+residential, family = 'gaussian', data = training2 )
+
+plot(effect("parks", covid_movilidad_ESP_GLM.modmovilidad), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="parks", ylab="rate", rug=FALSE, main="")
+
+
+plot(effect("grocery_and_pharmacy", covid_movilidad_ESP_GLM.modmovilidad), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="grocery_and_pharacy", ylab="rate", rug=FALSE, main="")
+
+plot(effect("residential", covid_movilidad_ESP_GLM.modmovilidad), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="residential", ylab="rate", rug=FALSE, main="")
+
+
+
+```
+
+Como hemos analizado antes, ambas variables respuesta tienden a tener muchos ceros, por lo que se podría tratar de modelos con cero inflado. Los modelos de 0 inflado te aplican primero una regresión logística para calsificar el 0 y luego el método que tu le quieras aplicar. Aplicando la misma metodología, hemos hecho un bucle con las diferentes distancias sobre el cero inflado. En el primer modelo no se pueden sacar nada concluyente ya que está lleno de Nas.
+
+```{r, echo=FALSE, warning=FALSE}
+dist1 <-  c('geometric','poisson','negbin')
+best_family <- function(family){
+  for (x in family){
+    covid_movilidad_ESP_GLM.mod <- zeroinfl(num_casos~PCR+hospitalized*recovered + hospitalized*deceased, dist= x, data = training )
+    print(paste('dist:',x))
+    print(summary(covid_movilidad_ESP_GLM.mod))
+    print('-----------')
+  }
+}
+best_family(family = dist1)
+```
+
+Para este  modelo he utilizado todas las variables en la parte de dist y solamente el total de movilidad en la parte logística. Aquí podemos observar que el mejor modelo es el que aplica la poisson donde podemos encontrar el mejor log-likelihood y los mejores betas. En la parte logística podemos analizar que ni los transit_stations ni workplaces son del todo influyentes en el modelo, mientras que el resto de variables sí. En la tabla binomial, se ve que el total de movilidad es influyente sobre la variable respuesta con un beta negativo.
+
+```{r,echo=FALSE, warning=FALSE}
+
+best_family <- function(family){
+  for (x in family){
+    covid_movilidad_ESP_GLM.mod <- zeroinfl(num_casos~retail_and_recreation+grocery_and_pharmacy+parks+transit_stations+workplaces+residential | total_mov, dist = x, data = training2 )
+    print(paste('dist:',x))
+    print(summary(covid_movilidad_ESP_GLM.mod))
+    print('-----------')
+  }
+}
+
+best_family(family = dist1)
+
+```
+
+## Predicciones e intervalos
+
+Hemos obtenido mejor correlación en nuestro modelo geométrico que en nuestro modelo de cero inflado. Por eso utilizaremos nustro modelo geométrico para realizar las predicciones y calcular los intervalos. Podemos observar que los intervalos son muy amplios por lo tanto el error a la hora de predecir va a ser muy alto.
+
+```{r, echo=FALSE, warning=FALSE}
+ceroinf_mov <- zeroinfl(num_casos~retail_and_recreation+grocery_and_pharmacy+parks+transit_stations+workplaces+residential | total_mov, dist = 'poisson',link = 'log', data = training2 )
+
+plot(training2$num_casos, predict(covid_movilidad_ESP_GLM.modmovilidad, type = "response"),
+     xlab="actual",ylab="predicted")+
+cor(training2$num_casos,predict(covid_movilidad_ESP_GLM.modmovilidad, type = "response"))
+
+plot(training2$num_casos, predict(ceroinf_mov, type = "response"),
+     xlab="actual",ylab="predicted")
+cor(training2$num_casos,predict(ceroinf_mov, type = "response"))^2
+
+prediction_mov = predict(covid_movilidad_ESP_GLM.modmovilidad, newdata = testing2,type = 'response', se.fit = T)
+head(prediction_mov,10)
+```
+```{r, echo=FALSE,include=FALSE}
+critval <- 1.96 
+upr <- prediction_mov$fit + (critval * prediction_mov$se.fit)
+lwr <- prediction_mov$fit - (critval * prediction_mov$se.fit)
+fit <- prediction_mov$fit
+fit[1:10]
+
+fit2 <- covid_movilidad_ESP_GLM.modmovilidad$family$linkinv(fit)
+upr2 <- covid_movilidad_ESP_GLM.modmovilidad$family$linkinv(upr)
+lwr2 <- covid_movilidad_ESP_GLM.modmovilidad$family$linkinv(lwr)
+fit2[1:10]
+```
+```{r,echo=FALSE}
+
+print(data.frame(lower=lwr2, prediction=round(fit2,digits=0), upper=upr2)[1:10,])
+
+```
+
+# Regresión Avanzada
+
+Para la regresión avanzada, vamos a utilizar la fusión de movilidad y covid por provincias que hemos realizado antes del modelo GLM, ya que para el modelo GLM habíamos descartado muchas para mejorar la interpretación. Este dataset esta formado por 22 variables, lo que será suficiente para nuestro modelo de regresión avanzada.
+
+En primer lugar dividiremos nuestro dataset en training y testing. Graficando nuestra variable respuesta, que ahora es las muertes diarias, podemos observar que no hay grupos muy diferenciados. Con esto podemos observar grupos más diferenciados donde estan lo diás que ha habido pocas muertes y aquellos donde ha habido más
+
+
+```{r, echo=FALSE}
+set.seed(2234)
+in_train_RA <- createDataPartition(covid_movilidad_ESP$daily_deaths, p = 0.80, list = FALSE)
+training_RA<- covid_movilidad_ESP[ in_train_RA,]
+testing_RA <- covid_movilidad_ESP[-in_train_RA,]
+
+ggplot(training_RA, aes(daily_deaths)) + geom_density(fill="lightblue") + 
+  xlab("daily_deaths") + ggtitle("Total daily_deaths")
+
+ggplot(training_RA, aes(log(daily_deaths+10))) + geom_density(fill="lightblue") + 
+  xlab("log(daily_deaths+10)") + ggtitle("Total daily_deaths")
+```
+
+Podemos observar, en el primer gráfico, que no hay relación aparente entre las muertes y los datos de movilidad diarios. Para saber el impacto que puede tener cada una de las variables con la variable respuesta, he creado un segundo gráfico de barras de la correlación de las diferentes variables con la variable respuesta, y las he ordendo de mayor a menos. Podemos observar que muchas de ellas están por encima del 50% de correlación y que prácticamente todas las de movilidad tienen una correlación negativa muy baja
+
+```{r, echo=FALSE}
+featurePlot(x = training_RA[, c(18:22)],
+            y = log(training_RA$daily_deaths+10),
+            plot = "scatter",
+            layout = c(4, 2))
+
+corr_daily_deaths <- sort(cor(training_RA[,c(3:22)])["daily_deaths",], decreasing = T)
+corr=data.frame(corr_daily_deaths)
+ggplot(corr,aes(x = row.names(corr), y = corr_daily_deaths)) + 
+  geom_bar(stat = "identity", fill = "lightblue") + 
+  scale_x_discrete(limits= row.names(corr)) +
+  labs(x = "", y = "Daily Deaths", title = "Correlations") + 
+  theme(plot.title = element_text(hjust = 0, size = rel(1.5)),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Métodos de regresión
+
+Antes de empear a entrenar nuestro modelo, es necesario implementar algunos métodos que optimizarán su entrenamiento. Vamos a diseñar en primer lugar una variable que realizará el cross validatión para así entrenar mejor nuestro modelo. El cross validation va a dividir nuestro set de entrenamiento en 5 bloques y va a repetir cada secuencia de entrenamiento 4 veces por bloque. Para que nuetos modelos de regularización nos puedean mejorar los betas, tenemos que introducirle únicamente variables numéricas. Es por eso, que he eliminado todas las posibles variables categóricas del dataset.
+
+```{r, echo=FALSE, include=FALSE}
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5, repeats = 4)
+
+training_RA$ccaa <- NULL
+testing_RA$ccaa <- NULL
+training_RA$date <- NULL
+testing_RA$date <- NULL
+training_RA$poblacion <- NULL
+testing_RA$poblacion <- NULL
+
+modelo_RA = daily_deaths ~.
+
+```
+### Ridge Regression
+
+En este método se se utiliza la norma 2 lo que hace que se añada más bias y se reduzca la varianza para encontrar el punto óptimo. Para poder realizar el proceso, hemos diferenciado nuestra variable respuesta del resto de dataset, para más adelante predecirla. El segundo paso ha sido identificar donde se encuentra más o menos el punto óptimo, para ello hemos utilizado un grid amplio, y una vez que nos hemos dado cuenta que el óptimo estaba entre 2 y 4 hemos ido ajustando el grid entre esos puntos.
+
+```{r, echo = FALSE}
+X = model.matrix(modelo_RA, data=training_RA)[,-1]  
+y = training_RA$daily_deaths
+
+grid = seq(9, 50)  
+
+
+ridge.mod = glmnet(X, y, alpha=0, lambda=grid)  
+
+
+plot(ridge.mod, xvar="lambda")
+
+```
+
+
+En tercer lugar hemos hecho un cross validation con lambda = 0, para encontrar el mejor lambda. Aquí podemos observar que el mejor lambda para predecir es lambda = 1,43. El segundo lambda es mejor utilizarlo para interpretar y así ver los betas.
+
+```{r,echo=FALSE}
+ridge.cv = cv.glmnet(X, y, type.measure="mse", alpha=0)
+plot(ridge.cv)
+opt.lambda <- ridge.cv$lambda.min
+print(paste0('Lambda para predecir:',opt.lambda))
+print(paste0('Lambda para explicar:',ridge.cv$lambda.1se))
+
+lambda.index <- which(ridge.cv$lambda == ridge.cv$lambda.1se)
+beta.ridge <- ridge.cv$glmnet.fit$beta[, lambda.index]
+beta.ridge
+```
+
+A la hora de predecir tenemos que utilizan nuestro testing set. Podemos observar que las métricas de RMSE y MAE son muy altas indicando que los valores predichos y observados son muy lejanos entre sí. Aun así, para el R-cuadrado nuestro modelo lo ha hecho decentemente.
+
+```{r, echo=FALSE}
+X.test = model.matrix(modelo_RA, data = testing_RA)[,-1]
+y.test = testing_RA$daily_deaths
+test_results <- data.frame(daily_deaths = testing_RA$daily_deaths)
+ridge.pred = predict(ridge.cv$glmnet.fit, s=opt.lambda, newx=X.test)
+print(postResample(pred = ridge.pred,  obs = y.test))
+test_results$ridge <- ridge.pred
+```
+
+### Regresión de Lasso
+
+La reresión de Lasso a diferencia de la de Ridge, utiliza la norma 1 lo que hace que no haya gradiente que minimice y tenga que acudir a un algoritmo de optimización. En este método a diferencia del de Ridge, te lleva los betas a 0 y selecciona los mejores betas, lo que hace que sea mejor para interpretar.
+
+Podemos observar que el lambda más pequeño, y por lo tanto el que se utilizaría para predecir, es prácticamente 0 lo que hace que sea muy cercano al OLS (mínimos cuadrados). El segundo lambda es 1.61 y como hemos dicho anteriormente es mejor interpretar con este por eso acontinuación vamos a sacar los betas en función de este lambda.
+
+```{r, echo=FALSE}
+lasso.mod = glmnet(X, y, alpha=1, lambda=seq(.01, 1, length = 100))  
+
+lasso.cv = cv.glmnet(X, y, type.measure="mse", alpha=1)
+plot(lasso.cv)
+
+opt.lambda <- lasso.cv$lambda.min
+print(paste0('Lambda para predecir:',opt.lambda))
+print(paste0('Lambda para explicar:',ridge.cv$lambda.1se))
+```
+
+Analizando este conjunto de datos, prácticamente todos los betas se van a 0 lo que hace que no sean significtivos en nuestro modelo. En cambio, Lasso ha elegido otras variables como: activos, intensive_care, deceased, num_def, num_casos_prueba_pcr y num_hosp como variables significativas.
+
+```{r, echo=FALSE}
+plot(lasso.cv$glmnet.fit, xvar="lambda")
+
+lambda.index <- which(lasso.cv$lambda == lasso.cv$lambda.1se)
+beta.lasso <- lasso.cv$glmnet.fit$beta[, lambda.index]
+beta.lasso
+```
+
+Podemos observar que sigue tienendo un error muy alto en la predicción aunque en las métricas de RMSE y MAE, ha ejecutado mejor que en Ridge Regression.
+
+```{r, echo=FALSE}
+lasso.pred = predict(lasso.cv$glmnet.fit, s=opt.lambda, newx=X.test)
+print(postResample(pred = lasso.pred,  obs = y.test))
+test_results$lasso <- lasso.pred
+```
+### Elastic Net
+
+Elastic Net utiliza tanto la norma 1, como la norma 2. El coste computacional es mayor porque tienen que optimizar dos hiperparámetros que son alpha y lambda. Además este método suele predecir mejor que los dos anteriores. Para realizar la prediccion he utilizado en este caso el paquete caret. En el gráfico podemos observar los hiperparámetros y el error de predicción. A simple vista es dificil de interpretar pero observando el aplha y el lambda vemos que la mejor combinación para Elastic Net sería un alpha = 0.03 y un lambda = 0.04.
+
+En este caso Elastic Net tiene peores métricas que Lasso y Ridge por lo tanto, para este problema no se utilizará.
+```{r, echo=FALSE}
+elastic_grid = expand.grid(alpha = seq(0, .2, 0.01), lambda = seq(0, .1, 0.01))
+glmnet_tune <- train(modelo_RA, data = training_RA,
+                     method='glmnet',
+                     preProc=c('scale','center'),
+                     tuneGrid = elastic_grid,
+                     trControl=ctrl)
+plot(glmnet_tune)
+print(glmnet_tune$bestTune)
+test_results$glmnet <- predict(glmnet_tune, testing_RA)
+print(postResample(pred = test_results$glmnet,  obs = test_results$daily_deaths))
+
+```
+## Métodos de reducción de dimensiones
+
+Los métodos de reducción de dimensión simplifican el número de variables que se utilizan para el modelo. Para ello utilizaremos el PCR y el PLS que son los utilizados en regresión. Ambos utilizan PCA para reducir lo único que PCR utiliza los betas para hacer la regresión . En cambio en PLS le das más peso a la variable que tenga más correlación reemplazando la formula de los PCAs por los betas. En resumen, PCR identifica la dirección de una manera no supervisada, mientras que PLS lo hace de una manera supervisada utilizando 'y'.
+
+### PCR
+
+Este método, como hemos dicho anteriormente, utiliza PCA para hacer la componentes y luego a través de cross validation elige cuantas componentes utilizar, maximizando la información de las 'x'. Podemos ver que entre utilizar 5 o 6 componentes vamos a tener prácticamente el mismo error pero entre utilizar 5 u 8 ya cambia bastante.
+
+Las métricas aun así, no son muy buenas empeorando los resultados que habíamos obtenido en el mejor método de regresión.
+```{r, echo=FALSE}
+pcr_tune <- train(modelo_RA, data = training_RA,
+                  method='pcr',
+                  preProc=c('scale','center'),
+                  tuneGrid = expand.grid(ncomp = 2:8),
+                  trControl=ctrl)
+plot(pcr_tune)
+test_results$pcr <- predict(pcr_tune, testing_RA)
+postResample(pred = test_results$pcr,  obs = test_results$daily_deaths)
+
+```
+
+### PLS
+
+En este método se da más peso a aquellas variables que predicen mejor observando la variable respuesta, minimizando el error de prediccion de la 'y'. En el gráfico podemos ver que con PLS probablemente lo mejor seria utilizar 5 o 6 componentes ya que no hay mucha diferencia en el error al utilizar más.
+
+PLS suele predecir mejor que PCR, pero en este caso esta prediciendo peor, si nos fijamos en las métricas.
+
+```{r, echo=FALSE}
+pls_tune <- train(modelo_RA, data = training_RA,
+                  method='pls',
+                  preProc=c('scale','center'),
+                  tuneGrid = expand.grid(ncomp = 2:8),
+                  trControl=ctrl)
+plot(pls_tune)
+test_results$pls <- predict(pls_tune, testing_RA)
+postResample(pred = test_results$pls,  obs = test_results$daily_deaths)
+
+```
+
+## Modelo final
+
+Para el modelo final, únicamente utilizaré Lasso ya que ha sido el método que mejores métricas me ha dado. A través de esté modelo, calcularé los intervalos de confianza de la variable.
+
+Podemos observar que las bandas de los intervalos de confianza son muy anchas y las prediccioness no son nada buenas, prediciendo incluso números negativos, lo que no tiene sentido en este problema ya que las muertes no pueden ser negativas.
+
+```{r, echo =FALSE}
+
+final <-  test_results$lasso
+hist(final, col="lightblue")
+
+y = test_results$daily_deaths
+error = y-final
+hist(error, col="lightblue")
+
+noise = error[1:100]
+sd.noise = sd(noise)
+
+lwr = final[101:length(final)] - 1.65*sd.noise
+upr = final[101:length(final)] + 1.65*sd.noise
+
+
+predictions <-  data.frame(real=y[101:length(y)], fit=final[101:length(final)], lwr=lwr, upr=upr)
+print(head(predictions))
+````
+
+# Conclusiones
+
+A nivel predictivo no podemos conlcuir afirmando nada, ya que las predicciones han sido muy malas. Esto se ha dado principalmente por la calidad de nuestros datos, con un datset que contenía muchos missing values que han tenido que ser imputados de manera manual. 
+
+A nivel explicativo no puedo sacar muchas conclusiones ya que muchos de los modelos me daban soluciones muy extrañas como que, a medida que aumentan los test PCR aumentan el número de fallecidos. Esto no podría darse en un entorno realista ya que, a medida que aumentan las pruebas PCR los especialistas deberían tener mas recursos para reducir la incertidumbre y de verdad tratar de una manera específica a aquellos pacientes con Covid. Los únicos datos que han podido tener valor explicativo son los de movilidad, ya que a medida que las personas frecuentaban más las farmacias y supermercados aumenta lo que es bastante significativo ya que a las farmacias acuden personas enfermas que pueden presentar síntomas del virus. Pero en cambio había otras variables de movilidad como la de estaciones de metro, que en un principio las verías muy relevantes en tu modelo y luego no lo han sido. Otras variables como la de movilidad en los parques que te daba también resultados incongruentes como que a medida que aumenta el tránsito en los parques diminuía el número de casos
+
+En conclusión, es muy arriesgado afirmar ciertas teorías sobre recursos y movilidad. Con los resultados obtenidos no podríamos sacar nada en claro para confirmar que el Covid se dió por una falta de recursos y de previsión o incluso por malas decisiones.
